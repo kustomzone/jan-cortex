@@ -3,12 +3,10 @@
 #include <stdio.h>
 #include <trantor/utils/Logger.h>
 #include <filesystem>
+#include <optional>
 #include <thread>
 
 #include "download_service.h"
-#include "exceptions/failed_curl_exception.h"
-#include "exceptions/failed_init_curl_exception.h"
-#include "exceptions/failed_open_file_exception.h"
 #include "utils/logging_utils.h"
 
 namespace {
@@ -24,20 +22,37 @@ void DownloadService::AddDownloadTask(
   CLI_LOG("Validating download items, please wait..");
   // preprocess to check if all the item are valid
   auto total_download_size{0};
+  std::optional<std::string> err_msg = std::nullopt;
   for (const auto& item : task.items) {
-    try {
-      total_download_size += GetFileSize(item.downloadUrl);
-    } catch (const FailedCurlException& e) {
-      CTL_ERR("Found invalid download item: " << item.downloadUrl << " - "
-                                              << e.what());
-      throw;
+    auto file_size = GetFileSize(item.downloadUrl);
+    if (file_size.has_error()) {
+      err_msg = file_size.error();
+      break;
     }
+
+    total_download_size += file_size.value();
+  }
+
+  if (err_msg.has_value()) {
+    CTL_ERR(err_msg.value());
+    return;
   }
 
   // all items are valid, start downloading
+  // if any item from the task failed to download, the whole task will be
+  // considered failed
+  std::optional<std::string> dl_err_msg = std::nullopt;
   for (const auto& item : task.items) {
     CLI_LOG("Start downloading: " + item.localPath.filename().string());
-    Download(task.id, item);
+    auto result = Download(task.id, item);
+    if (result.has_error()) {
+      dl_err_msg = result.error();
+      break;
+    }
+  }
+  if (dl_err_msg.has_value()) {
+    CTL_ERR(dl_err_msg.value());
+    return;
   }
 
   if (callback.has_value()) {
@@ -45,12 +60,13 @@ void DownloadService::AddDownloadTask(
   }
 }
 
-uint64_t DownloadService::GetFileSize(const std::string& url) const {
+cpp::result<uint64_t, std::string> DownloadService::GetFileSize(
+    const std::string& url) const noexcept {
   CURL* curl;
   curl = curl_easy_init();
 
   if (!curl) {
-    throw FailedInitCurlException();
+    return cpp::fail(static_cast<std::string>("Failed to init CURL"));
   }
 
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -59,9 +75,8 @@ uint64_t DownloadService::GetFileSize(const std::string& url) const {
   CURLcode res = curl_easy_perform(curl);
 
   if (res != CURLE_OK) {
-    // if we have a failed here. it meant the url is invalid
-    throw FailedCurlException("CURL failed: " +
-                              std::string(curl_easy_strerror(res)));
+    return cpp::fail(static_cast<std::string>(
+        "CURL failed: " + std::string(curl_easy_strerror(res))));
   }
 
   curl_off_t content_length = 0;
@@ -83,8 +98,9 @@ void DownloadService::AddAsyncDownloadTask(
   // TODO: how to call the callback when all the download has finished?
 }
 
-void DownloadService::Download(const std::string& download_id,
-                               const DownloadItem& download_item) {
+cpp::result<void, std::string> DownloadService::Download(
+    const std::string& download_id,
+    const DownloadItem& download_item) noexcept {
   CTL_INF("Absolute file output: " << download_item.localPath.string());
 
   CURL* curl;
@@ -93,14 +109,13 @@ void DownloadService::Download(const std::string& download_id,
 
   curl = curl_easy_init();
   if (!curl) {
-    throw FailedInitCurlException();
+    return cpp::fail(static_cast<std::string>("Failed to init CURL"));
   }
 
   file = fopen(download_item.localPath.string().c_str(), "wb");
   if (!file) {
-    auto err_msg{"Failed to open output file " +
-                 download_item.localPath.string()};
-    throw FailedOpenFileException(err_msg);
+    return cpp::fail(static_cast<std::string>(
+        "Failed to open output file " + download_item.localPath.string()));
   }
 
   curl_easy_setopt(curl, CURLOPT_URL, download_item.downloadUrl.c_str());
@@ -112,10 +127,15 @@ void DownloadService::Download(const std::string& download_id,
   res = curl_easy_perform(curl);
 
   if (res != CURLE_OK) {
-    fprintf(stderr, "curl_easy_perform() failed: %s\n",
-            curl_easy_strerror(res));
+    fclose(file);
+    curl_easy_cleanup(curl);
+    std::string err_msg{curl_easy_strerror(res)};
+
+    return cpp::fail(
+        static_cast<std::string>("Download failed! Error: " + err_msg));
   }
 
   fclose(file);
   curl_easy_cleanup(curl);
+  return {};
 }

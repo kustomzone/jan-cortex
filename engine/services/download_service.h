@@ -5,6 +5,7 @@
 #include <optional>
 #include <sstream>
 #include <vector>
+#include "utils/result.hpp"
 
 enum class DownloadType { Model, Engine, Miscellaneous, CudaToolkit, Cortex };
 
@@ -66,9 +67,11 @@ class DownloadService {
    *
    * @param url - url to get file size
    */
-  uint64_t GetFileSize(const std::string& url) const;
+  cpp::result<uint64_t, std::string> GetFileSize(
+      const std::string& url) const noexcept;
 
  private:
-  void Download(const std::string& download_id,
-                const DownloadItem& download_item);
+  cpp::result<void, std::string> Download(
+      const std::string& download_id,
+      const DownloadItem& download_item) noexcept;
 };
